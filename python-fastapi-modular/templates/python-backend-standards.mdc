@@ -1,0 +1,76 @@
+---
+description: Python FastAPI 模块化单体后端规范 — 分层、命名、错误码、安全通道（alwaysApply）
+globs: "**/*.py"
+alwaysApply: true
+---
+
+# Python FastAPI 后端规范（速查）
+
+> 完整规范见 `.cursor/skills/python-fastapi-modular/`
+
+## 分层（强制）
+
+```
+Router → Service → Repository
+```
+
+- Router：参数校验、权限、调 Service、返回 `CommonResult`
+- Service：规则、事务、编排、返回 RespSchema（禁止返回 ORM model）
+- Repository：SQLAlchemy CRUD（禁止调 Service）
+- 禁止 Router 直接注入 Repository 写业务
+
+## 目录结构
+
+```
+{base}/module_{domain}/
+├── api/              error_codes.py · enums.py · schemas.py（无 SQLAlchemy）
+└── biz/              router_admin.py · service.py · repository.py · models.py · convert.py
+```
+
+## 统一响应
+
+```python
+CommonResult.success(data)          # code=0
+CommonResult.error(code, msg)       # code!=0
+raise_exception(ERROR_CODE)         # 业务异常 → 200 + CommonResult.error
+raise_invalid_param("msg")          # 参数错误 → 400
+```
+
+禁止 `raise HTTPException` 表达业务错误。
+
+## 错误码
+
+```python
+# api/error_codes.py
+XXX_NOT_EXISTS = ErrorCode(1008007000, "xxx不存在")
+```
+
+- 一场景一常量；禁止运行时拼 msg；禁止多种原因共用笼统码
+- 仅签名 / token 不匹配允许笼统「签名验证失败」
+
+## 安全三通道
+
+| 通道 | 文件 | prefix | 鉴权 |
+|------|------|--------|------|
+| 管理端 | `router_admin.py` | `{admin-prefix}/{domain}/{resource}` | Bearer + `require_permission` |
+| C 端 | `router_app.py` | `{app-prefix}/...` | 用户 Token |
+| 外部 | `router_{开放名}.py` | `/external/{系统}` | 独立 Depends，不走管理端 Bearer |
+
+main.py 注册时传 `prefix`；router 内只写资源路径，不硬写前缀。
+
+## 软删除
+
+查询默认加 `XxxDO.deleted == False`；删除置 `deleted=True`，不 DELETE 行。
+
+## 日志
+
+```python
+logger = logging.getLogger(__name__)
+logger.info("[{domain}] 创建 key=%s", key)
+```
+
+禁止空 except；禁止打印 password / secret / sign / token。
+
+## 开放接口最低要求
+
+独立 router 文件 + 独立鉴权 Depends + 域内审计表（幂等 UNIQUE）+ 联调文档。
