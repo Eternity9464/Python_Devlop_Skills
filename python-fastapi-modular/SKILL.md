@@ -85,6 +85,9 @@ description: >-
 | 接口分通道 | 管理端 / C 端 / 外部对接，鉴权隔离 |
 | 统一契约 | `CommonResult`、ErrorCode、RespSchema 命名一致 |
 | 具体错误具体消息 | 每种失败独立 ErrorCode；禁止运行时拼 msg |
+| 外部数据源容错 | 上游不可用时返回旧数据 + `stale_error` 标记，不让页面崩溃 |
+| 缓存线程安全 | 所有共享缓存对象必须用 `threading.Lock` 保护读写 |
+| 配置与代码分离 | 密钥、阈值、URL 全部走 `.env`；禁止硬编码业务节点数据 |
 
 ---
 
@@ -208,6 +211,10 @@ Service 禁止空 except；禁止 log 明文 password / secret / sign / token。
 | 生产访问日志 | 管理端 enable |
 | HTTP 失败 | 对内 200 + body.code；网关可映射 4xx |
 | 旧代码 | 触达再改，不一次性重构 |
+| 外部数据源 | 上游失败返回旧数据 + `stale_error`，不 crash |
+| 缓存对象 | 共享缓存必须配 `threading.Lock`，读写都在 `with lock:` 内 |
+| 文件写入 | 写本地文件必须 `tempfile + os.replace()` 原子替换 |
+| 启动预热 | 重型查询在应用启动时后台线程预热，第一个用户不等待 |
 
 ---
 
@@ -224,6 +231,13 @@ Service 禁止空 except；禁止 log 明文 password / secret / sign / token。
 | `raise HTTPException` 表达业务 | api 定义 ErrorCode + `raise ServiceException(...)` |
 | 多种失败共用一句笼统 msg | 每场景独立 ErrorCode（安全敏感除外） |
 | 业务类放进 framework | 业务进 `module_*` |
+| 所有路由堆在单个文件（>500行） | 按域拆分 `router_admin.py`，main.py 只做注册 |
+| 节点/站点配置硬编码进源码 | 走 `.env` 或配置文件，代码不改能换环境 |
+| 直接写文件（写到一半崩溃→损坏） | `tempfile.mkstemp()` + `os.replace()` 原子替换 |
+| 多线程共享缓存无锁直接读写 | `threading.Lock` 保护，读写都在 `with lock:` 内 |
+| 上游 API 失败直接 500 / 抛异常 | 返回旧缓存数据 + `stale_error` 标记，页面降级展示 |
+| 应用启动后第一个用户触发重型查询 | 启动时后台线程 `prewarm()`，缓存提前就绪 |
+| `hmac` 比较密码用 `==` | `hmac.compare_digest()` 防时序攻击 |
 
 ---
 

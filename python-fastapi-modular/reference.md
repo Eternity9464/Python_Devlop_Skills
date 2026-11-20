@@ -191,8 +191,224 @@ async def get_scoped_query(current_user=Depends(get_current_user)):
 
 ---
 
-## 修订
+---
+
+## 内存缓存模式（外部 API 聚合场景）
+
+适用于：调用 Zabbix / Splunk / Confluence 等重型外部 API，单次查询耗时 5-30 秒。
+
+### 标准缓存类
+
+```python
+# framework/cache/base.py
+import threading
+
+class _Cache:
+    """线程安全的单值缓存容器。"""
+    def __init__(self):
+        self.data = None
+        self.ts   = 0.0
+        self.lock = threading.Lock()
+```
+
+### Stale-While-Revalidate（推荐）
+
+```python
+# 适合：数据轻微过期可接受，绝不能让用户等待
+import time, threading
+
+_cache = _Cache()
+_refreshing = threading.Lock()
+TTL = 60  # 秒
+
+def get_data(force=False):
+    now = time.time()
+    with _cache.lock:
+        data, ts = _cache.data, _cache.ts
+
+    if data and not force:
+        if now - ts >= TTL:
+            _refresh_async()     # 后台刷新，立刻返回旧数据
+        return data              # ← 用户 <1ms 拿到数据
+
+    return _fetch_and_store()    # 首次或 force：同步等待
+
+def _refresh_async():
+    if not _refreshing.acquire(blocking=False):
+        return                   # 已有刷新在跑，不重复启动
+    def run():
+        try:
+            _fetch_and_store()
+        except Exception:
+            pass                 # 刷新失败：继续用旧数据
+        finally:
+            _refreshing.release()
+    threading.Thread(target=run, daemon=True).start()
+
+def _fetch_and_store():
+    data = _call_external_api()  # 实际查询
+    with _cache.lock:
+        _cache.data = data
+        _cache.ts   = time.time()
+    return data
+```
+
+### 启动预热（prewarm）
+
+应用启动时立即在后台填充缓存，第一个用户不必等待：
+
+```python
+# 在 create_app() / lifespan 末尾调用
+def prewarm():
+    def run():
+        try:
+            get_data()
+        except Exception:
+            pass
+    threading.Thread(target=run, daemon=True).start()
+```
+
+### 后台定时刷新（适合超重型查询）
+
+```python
+# 适合：单次查询 >30s，不能放在请求链路里
+import time, threading
+
+def start_refresher(interval: int = 120):
+    def loop():
+        while True:
+            try:
+                _fetch_and_store()
+            except Exception:
+                pass
+            time.sleep(interval)
+    threading.Thread(target=loop, daemon=True).start()
+```
+
+**选型指引**：
+
+| 场景 | 策略 |
+|------|------|
+| 查询 <5s，轻微过期可接受 | Stale-While-Revalidate |
+| 查询 >30s | 后台定时刷新 + prewarm |
+| 文件内容（xlsx/json），按需读 | mtime 感知（见下节） |
+
+---
+
+## 文件缓存：mtime 感知
+
+适用于：本地 xlsx / JSON 文件，由外部上传替换，内容变化即失效。
+
+```python
+import os
+
+_file_cache = {}  # path -> (key, data)
+
+def load_file(path: str):
+    st = os.stat(path)
+    key = (st.st_mtime_ns, st.st_size)   # 变化信号
+    hit = _file_cache.get(path)
+    if hit and hit[0] == key:
+        return hit[1]                     # 文件未变，直接返回
+    data = _parse(path)                   # 重新解析
+    _file_cache[path] = (key, data)
+    return data
+```
+
+---
+
+## 原子文件写入
+
+**禁止**直接 `open(path, "w")` 写文件，写到一半程序崩溃会导致文件损坏。
+
+```python
+import os, tempfile, json
+
+def atomic_write_json(path: str, data: dict) -> None:
+    dir_ = os.path.dirname(path)
+    os.makedirs(dir_, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)   # 原子替换：要么旧文件完好，要么新文件完整
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+```
+
+xlsx 同理：先写临时文件 → `validate()` → `os.replace()`。
+
+---
+
+## 外部数据源降级策略
+
+上游 API（Zabbix / Splunk / Confluence 等）不可用时，**不应让页面直接 500**。
+
+```python
+def get_public_ips(force=False):
+    now = time.time()
+    with _lock:
+        data, ts = _cache["data"], _cache["ts"]
+
+    if data and not force and now - ts < TTL:
+        return data
+
+    try:
+        fresh = parse(_fetch())       # 请求上游
+    except Exception as e:
+        if data:
+            # ✅ 有旧数据：降级返回，标记为 stale
+            return dict(data, stale_error=str(e))
+        raise                         # 从未成功过：让调用方处理
+
+    with _lock:
+        _cache["data"], _cache["ts"] = fresh, now
+    return fresh
+```
+
+Router / 页面层：
+
+```python
+result = get_public_ips()
+if result.get("stale_error"):
+    # 展示 banner："数据来自缓存，上游暂时不可用"
+    ...
+```
+
+规则：
+- 有旧数据 → 降级展示 + 告警
+- 从未有数据 → 抛出，让页面展示明确的错误信息
+- 禁止静默吞掉异常后返回空数据（用户不知道数据有问题）
+
+---
+
+## 安全字符串比较（防时序攻击）
+
+比较密码、Token、签名时，**禁止用 `==`**：
+
+```python
+# ❌ 危险：长度不同时提前返回，攻击者可枚举
+if user_input == stored_password:
+    ...
+
+# ✅ 安全：固定时间比较，不泄露信息
+import hmac
+if hmac.compare_digest(user_input.encode(), stored_password.encode()):
+    ...
+```
+
+同样适用于 HMAC 签名验证：
+
+```python
+expected = hmac.new(secret.encode(), payload.encode(), "sha256").hexdigest()
+if not hmac.compare_digest(received_sign, expected):
+    raise_exception(SIGN_FAILED)
+```
+
+
 
 | 日期 | 说明 |
 |------|------|
 | 2026-11-19 | 从 java-modular-monolith 转换为 Python FastAPI 版本 |
+| 2026-11-20 | 补充缓存模式、原子文件写入、降级策略、安全比较（来自生产项目实践） |

@@ -88,7 +88,30 @@
 
 ---
 
-## Review 反馈格式
+## 外部数据源 / 缓存
+
+- [ ] 外部 API 调用有 `try/except`；有旧数据时降级返回 `stale_error`，不直接 500
+- [ ] 共享缓存对象（`_Cache`）读写均在 `with lock:` 内
+- [ ] 重型查询（>5s）走 Stale-While-Revalidate 或后台定时刷新，不阻塞请求
+- [ ] 应用启动时 `prewarm()` 预热缓存，第一个用户不等待
+
+---
+
+## 文件读写
+
+- [ ] 写本地文件使用 `tempfile.mkstemp()` + `os.replace()` 原子替换
+- [ ] 读本地文件用 `(mtime_ns, size)` 做缓存 key，文件变化自动重载
+- [ ] 上传文件先 `validate()` 再 `os.replace()`，校验失败删临时文件
+
+---
+
+## 安全
+
+- [ ] 密码 / Token / 签名比较使用 `hmac.compare_digest()`，不用 `==`
+- [ ] `SECRET_KEY` / `ADMIN_PASSWORD` 未配置时应用启动即拒绝（`raise RuntimeError`）
+- [ ] Session redirect 目标校验：`nxt.startswith("/")` 且不以 `//` 开头（防开放重定向）
+
+---
 
 - 必须改：分层反了、错误码违规、开放通道鉴权混用、main.py 堆业务、secret 入日志
 - 建议改：命名不一致、日志前缀缺失、可抽共享 schema

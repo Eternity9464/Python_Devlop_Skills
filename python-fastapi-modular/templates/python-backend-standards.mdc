@@ -74,3 +74,45 @@ logger.info("[{domain}] 创建 key=%s", key)
 ## 开放接口最低要求
 
 独立 router 文件 + 独立鉴权 Depends + 域内审计表（幂等 UNIQUE）+ 联调文档。
+
+## 外部数据源缓存（聚合场景）
+
+```python
+# Stale-While-Revalidate 模式
+class _Cache:
+    def __init__(self): self.data=None; self.ts=0.0; self.lock=threading.Lock()
+
+def get_data(force=False):
+    now = time.time()
+    with _cache.lock:
+        data, ts = _cache.data, _cache.ts
+    if data and not force:
+        if now - ts >= TTL: _refresh_async()   # 过期 → 后台刷新
+        return data                            # 立刻返回旧数据
+    return _fetch_and_store()                  # 首次：同步等待
+
+def prewarm():   # 在 create_app() 末尾调用，启动预热
+    threading.Thread(target=_fetch_and_store, daemon=True).start()
+```
+
+- 重型查询（>5s）必须后台刷新，不阻塞请求
+- 上游失败有旧数据时返回 `dict(data, stale_error=str(e))`，不直接 500
+- 禁止静默吞异常后返回空数据
+
+## 原子文件写入
+
+```python
+# 禁止 open(path,"w") 直接写，崩溃会损坏文件
+fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
+with os.fdopen(fd, "w") as f: json.dump(data, f)
+os.replace(tmp, path)   # 原子替换
+```
+
+## 安全比较
+
+```python
+# 禁止 == 比较密码/签名（时序攻击）
+import hmac
+hmac.compare_digest(user_input.encode(), stored.encode())
+```
+
